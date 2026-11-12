@@ -232,6 +232,7 @@ jobs:
           (cd dist && shasum -a 256 "${NAME}.zip" > "${NAME}.zip.sha256")
           echo "archive=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance (Apple Silicon only)
         if: matrix.target == 'aarch64-apple-darwin'
