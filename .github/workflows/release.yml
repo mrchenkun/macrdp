@@ -130,6 +130,8 @@ jobs:
           # point it at an x86_64 clang when cross-compiling for Intel Macs.
           CC_X86_64_APPLE_DARWIN: clang
           CFLAGS_X86_64_APPLE_DARWIN: -target x86_64-apple-darwin
+          # Force the linker for cross-compilation targets.
+          CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER: clang
         run: |
           set -euo pipefail
           cargo build --release --locked --target "${{ matrix.target }}"
