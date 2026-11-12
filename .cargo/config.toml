@@ -1,0 +1,9 @@
+# Target-specific linker flags for cross-compiling Intel Mac binaries
+# on Apple Silicon GitHub Actions runners. Only applied when building
+# with --target x86_64-apple-darwin; aarch64 builds are unaffected.
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = [
+  "-C", "link-arg=-target",
+  "-C", "link-arg=x86_64-apple-darwin",
+]
