@@ -66,6 +66,9 @@ struct MtConnection {
     egfx_on_udp: bool,
     lossy_audio_block_no: u8,
     lossy_audio_streaming: bool,
+    /// The Soft-Sync request named the lossy audio channel. Until the client has
+    /// also acknowledged it, waves stay on TCP (see [`RdpServer::mt_route_lossy_audio`]).
+    lossy_audio_soft_synced: bool,
 }
 
 /// The cookie and bound flag the RNG adapter registered, read back by the server.
@@ -333,11 +336,19 @@ impl RdpServer {
         self.macrdp.mt.conn.tunnel_inbound_rx.take()
     }
 
-    /// The client's Initiate Multitransport Response, from the message channel. mstsc
-    /// never sends a success here (it signals success by creating the tunnel); a
-    /// client that does gets the empty Soft-Sync the response gate owes, sent by
-    /// [`Self::mt_send_owed_soft_sync`].
+    /// The client's Initiate Multitransport Response, from the message channel.
+    ///
+    /// mstsc does send `S_OK` here once the offer travels on the MCS message channel
+    /// (the rebased acceptor's behaviour since the e258f6a0 pin; the June 2026 notes
+    /// saw only tunnel creation). A connection gets exactly one Soft-Sync, so when
+    /// something is configured to migrate (lossy audio, or EGFX) the response must
+    /// NOT spend it on an empty request: [`Self::mt_soft_sync_on_egfx`] sends the one
+    /// that names the channel once it is open. Spending it here left the lossy audio
+    /// channel unmigrated, and mstsc dropped every wave streamed into the tunnel
+    /// (silent audio since v0.10.0). With nothing to migrate, the response gets the
+    /// empty Soft-Sync, sent by [`Self::mt_send_owed_soft_sync`].
     pub(super) fn mt_on_response(&mut self, response: &MultitransportResponsePdu) {
+        let has_channel_to_migrate = self.mt_has_channel_to_migrate();
         let Some(state) = self.macrdp.mt.conn.migration.as_mut() else {
             return;
         };
@@ -366,8 +377,20 @@ impl RdpServer {
             );
             return;
         }
+        if has_channel_to_migrate {
+            debug!(
+                request_id = response.request_id,
+                "Initiate Multitransport Response S_OK — leaving the Soft-Sync to the migration gate"
+            );
+            return;
+        }
         state.soft_sync_sent = true;
         self.macrdp.mt.conn.soft_sync_owed = true;
+    }
+
+    /// Whether this connection is configured to move a channel onto the tunnel.
+    fn mt_has_channel_to_migrate(&self) -> bool {
+        self.macrdp.mt.lossy_audio_formats.is_some() || self.macrdp.mt.migrate_egfx || migrate_egfx_enabled()
     }
 
     pub(super) async fn mt_send_owed_soft_sync(
@@ -471,9 +494,10 @@ impl RdpServer {
                 "UDP lossy tunnel bound — Soft-Sync migrating AUDIO_PLAYBACK_LOSSY_DVC onto the LOSSY (UdpFecL) \
                  tunnel (waves only; the format handshake runs on the reliable AUDIO_PLAYBACK_DVC over TCP)"
             );
-            return self
-                .send_soft_sync(writer, user_channel_id, SoftSyncTunnelType::LOSSY_UDP, vec![audio_id])
-                .await;
+            self.send_soft_sync(writer, user_channel_id, SoftSyncTunnelType::LOSSY_UDP, vec![audio_id])
+                .await?;
+            self.macrdp.mt.conn.lossy_audio_soft_synced = true;
+            return Ok(());
         }
 
         // EXPERIMENTAL (`--udp-migrate-egfx`, or `MACRDP_UDP_MIGRATE_EGFX`): name the
@@ -626,6 +650,17 @@ impl RdpServer {
         let Some(lossy_id) = self.open_channel_id::<AudioLossyDvc>() else {
             return Some(data);
         };
+        // The client reads the lossy channel from the tunnel only once it has
+        // processed the Soft-Sync that moves it there; a wave sent earlier is
+        // dropped (about the first half-second of every connection). Until the
+        // client acknowledges the Soft-Sync over TCP, keep the waves on TCP.
+        if !self.macrdp.mt.conn.lossy_audio_soft_synced
+            || !self
+                .get_svc_processor::<dvc::DrdynvcServer>()
+                .is_some_and(|drdynvc| drdynvc.soft_sync_response_received())
+        {
+            return Some(data);
+        }
         let conn = &mut self.macrdp.mt.conn;
         if !conn.lossy_audio_streaming {
             conn.lossy_audio_streaming = true;

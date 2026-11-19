@@ -33,6 +33,29 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   silently ignored) — resize needs the client-resolution
                           #   auto-adopt path, which --hidpi pins off, same as it
                           #   pins the initial connect-time size.
+--virtual-display-hidpi   # make the --virtual-display a Retina-style 2x display.
+                          #   The session size (--width/--height, or what the
+                          #   client requests) is its PIXEL count; macOS lays the
+                          #   UI out at half that in points — e.g. a client asking
+                          #   for 3456x2168 gets a sharp desktop that looks like
+                          #   1728x1084. Set VD_WIDTH/VD_HEIGHT to twice the size
+                          #   you want the UI to look. Scales for session widths of
+                          #   ~1440-4096 px; outside that macOS runs it 1:1 (logged
+                          #   as a warning). ~4x the pixels of the same apparent
+                          #   size without it. Live resize and auto-adopt keep
+                          #   working. Needs --virtual-display. Config: VD_HIDPI=1.
+                          #   The client must request Retina pixels (Windows App:
+                          #   "Optimize for Retina displays"); a client asking for
+                          #   point-size resolution gets UI twice as big.
+--virtual-display-hidpi=auto # the display stays HiDPI; each connection picks
+                          #   the UI scale from the client's announced desktop
+                          #   scale factor (Client Core Data). A 2x client (scale
+                          #   >= 200; Windows App with "Optimize for Retina
+                          #   displays") gets the UI at half its size, captured
+                          #   1:1; any other client gets the UI at its own size,
+                          #   captured down from the 2x backing. Normal-size UI
+                          #   either way. 1x clients wider than ~2048 px fall back
+                          #   to half-size UI. Config: VD_HIDPI=auto.
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
@@ -56,10 +79,21 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Ctrl+click on a link opens it in a new tab instead
                           #   of a secondary click (right/middle click and
                           #   scroll keep the real modifiers). macOS-only.
+--alt-q-quit              # Deliver Option+Q (Alt+Q from the client) as Cmd+Q
+                          #   so a Windows client can quit the focused app
+                          #   without the Windows key. Off by default. Plain
+                          #   Option only (Option+Shift+Q is NOT sent as
+                          #   Cmd+Shift+Q = log out). Config ALT_Q_QUIT=1.
+                          #   macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
                           #   auto-detected (e.g. com.microsoft.VSCode). macOS-only.
+--reverse-scroll          # Reverse the mouse-wheel direction (both axes) for the
+                          #   remote session. For a Mac with natural scrolling on,
+                          #   where a local tool (LinearMouse etc.) un-reverses the
+                          #   physical wheel but can't see macrdp's scroll events.
+                          #   Off by default. Config: REVERSE_SCROLL=1. macOS-only.
 MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   held modifiers are presumed stale and cleared on the
                           #   next input event (a key-up lost when the client lost
@@ -218,6 +252,15 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--h264-max-unacked-frames N # cap how many shipped frames may be awaiting the
+                          #   client's FrameAcknowledge on the TCP path; past it,
+                          #   captures drop (10 fps trickle) until the client
+                          #   catches up. Bounds lag when the client decodes at
+                          #   about the rate we send (otherwise every burst
+                          #   leaves a backlog that drains for seconds). 0 = off
+                          #   (default). Try 3-4. The --flush-frames
+                          #   re-sends are exempt, so the last change still shows.
+                          #   Config: H264_MAX_UNACKED_FRAMES.
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;
@@ -225,6 +268,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
+--capture-nv12            # EXPERIMENTAL (--enable-h264 only): ScreenCaptureKit delivers
+                          #   full-range BT.709 NV12 (GPU-converted) and VideoToolbox
+                          #   encodes those buffers directly — no per-frame CPU colour
+                          #   conversion or copy (14.3 → 3.3 ms CPU/frame at 3456x2168).
+                          #   Frames sent as legacy bitmaps are converted back to BGRA.
+                          #   Config key: CAPTURE_NV12.
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
                           #   instead of raw PCM; ~11x less bandwidth. PCM fallback is
                           #   automatic for clients without AAC decode. Adds ~40-50 ms
@@ -398,6 +447,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
                           #   default 100 ms of standing queue; replaces the removed
                           #   MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD),
+                          #   MACRDP_ADAPTIVE_QUEUE_RISE_MS (default 20: the delay
+                          #   only counts as congestion while it's GROWING by more
+                          #   than this between ~0.9 s windows; a flat standing delay,
+                          #   e.g. mstsc's ~120 ms video decode depth, doesn't),
+                          #   MACRDP_ADAPTIVE_QUEUE_CEILING_MS (default 400: above
+                          #   this it's congestion whatever the trend),
                           #   MACRDP_ADAPTIVE_EWMA_ALPHA, MACRDP_ADAPTIVE_FLOOR_FPS.
                           #   The RETX_TOLERANCE (default 2) is the per-interval
                           #   reliable-retransmit count tolerated before treating loss
@@ -550,6 +605,23 @@ each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
+Startup password failures (#266). The server reads and checks the account
+password before any other setup (sleep blocker, virtual display, helpers). If
+there is no usable password, or the check rejects it, a **headless** server
+(launchd) does not exit, since `KeepAlive` would restart it about every 10 s and
+each restart would be another failed login against the Mac account. Instead it
+logs `cannot start: no valid password for this Mac account …` once, writes
+`auth-status` next to `config.env` (line 1 `no-password` or `wrong-password`,
+line 2 the account), and waits. Every 30 s it re-reads the Keychain or password
+file without an account check, and checks again only when the stored password
+has changed, so a Keychain that unlocks later or an entry fixed in Keychain
+Access recovers on its own (log: `the stored password changed — checking it
+again`). The menu-bar controller shows "waiting for a valid password" with
+**Re-enter Password…**, which checks the new password before saving it and
+restarts the server. An **interactive** run (stdout a TTY)
+exits with the error as before. Override with
+`MACRDP_PARK_ON_AUTH_FAILURE=1` (always wait) or `0` (always exit).
+
 Blank recovery + auto-reconnect (env-tunable, **settable through `config.env`**
 — the matching keys are the same names minus the `MACRDP_` prefix, e.g.
 `BLANK_RECOVERY=0`; on by default with `--enable-h264`).
@@ -572,14 +644,17 @@ MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS=40  # nonzero reports (~5 s) that mark
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE=160  # all-zero reports (~20 s at the active cadence) required to recover an ESTABLISHED session — tolerates the brief zero-EDR windows a healthy client produces (a shorter window dropped a working 12-min session)
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS=30000  # wall-clock companion to the above: an established session is also declared blank once NOTHING nonzero has arrived for this long (with the report floor below) — bounds recovery on a STATIC blank, where QoE trickles at ~0.3/s and the 160-report count alone would take ~9 min
 MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS=16  # consecutive zeros the wall-clock branch needs — proves the client is still decoding, so an IDLE session (no frames, no QoE at all) never trips it
-MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions only)
+MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions, and only before the first recovery attempt)
 MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
-MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on cumulative-zero / total-silence evidence that interleaved phantom nonzero reports can't reset (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23)
+MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on total-silence evidence (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23); the interleaved-phantom case is the zero burst below
+MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS=3  # after a recovery attempt, escalate (the fallback drop) when this many zero-EDR reports arrive within the window below — a density rule, so a healed session's lone clock-tick zero (~1/min on a static desktop) never drops it; and only while zeros are at least half of the reports since the attempt; not applied once the session is ESTABLISHED (see ESTABLISHED_REPORTS), which uses the slower established-tier checks (1..=32)
+MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS=10000  # the window for the above (0 disables the zero-burst arm)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
 MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
 MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire
 MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped; only the drop fallback counts)
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
+MACRDP_EGFX_LEGACY_HOLD_MS=3000        # hold legacy bitmap updates on a new connection until EGFX is ready, at most this long (0 = off); Windows 10 mstsc freezes on a legacy picture sent just before EGFX
 ```
 
 Testing against the server:

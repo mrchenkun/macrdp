@@ -24,11 +24,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.0** (IronRDP pin bump a5d1c682 → e258f6a0, #194:
-SuppressOutput/NSCodec/honor-size/ARC cookie/preemption now upstream; vendored server
-divergences (29) cursor AND mask and (30) cookie fallback; plus contributor fixes since
-v0.9.11). Next: v0.10.1, which fixes the blank-recovery fast-path false drop, moves
-pasteboard reads off the server loop, and fixes the adaptive-bitrate oscillation on a LAN.
+(VPN/ZeroTier). **Latest release: v0.10.6** (a wrong or missing startup password
+no longer restarts the server in a loop: it waits and re-reads the Keychain, #267;
+HiDPI virtual display, #201; Windows 10 mstsc pictures, #228; pre-EGFX frame, #265;
+experimental `--capture-nv12`, #204; `--alt-q-quit`, #200).
+Next: #230 (Windows 10 frozen start), ported and waiting on rophy's OK.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

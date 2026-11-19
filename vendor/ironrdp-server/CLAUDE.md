@@ -60,6 +60,10 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (28) | `zstd-safe` 8.2 instead of upstream's 7.2 (RustSec advisories in 7.x; QOIZ only compresses, so unreachable) | `Cargo.toml` only | — |
 | (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
+| (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
+| (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
+| (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
+| (34) | RemoteFX (codec GUID REMOTEFX) goes out in a Stream Surface Bits command when the client sets `STREAM_SURFACE_BITS`; ImageRemoteFX (GUID IMAGE_REMOTEFX) and every other codec keep Set Surface Bits. RemoteFX wins over ImageRemoteFX whatever the client's list order. Windows 10 mstsc shows a black session for RemoteFX in Set. **Port of upstream #2229 (`e20a2147`); drops at the next pin bump** | `encoder/mod.rs` `RemoteFxCodec`, `SurfaceBitsCommand`, `surface_bits`, `UpdateEncoderCodecs::set_remotefx_codec`, `RemoteFxHandler`; `server.rs` `pick_remotefx_codec` and the `BitmapCodecs` arm | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -85,6 +89,63 @@ Notes on the port:
   `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`. Upstream
   candidate.
 
+- **(31)** Added 2026-11-13 while live-testing clintcan/macrdp#219 (hide the pointer
+  while an app hides it). The fragmenter's `encode_next` returned `None` for an empty
+  payload, so `DisplayUpdate::HidePointer` and `DefaultPointer` produced no bytes at
+  all: macrdp logged `cursor hidden`, yet FreeRDP's `restoreCursor` never saw a null
+  pointer and Windows App kept the arrow. Only the 3-line `fast_path.rs` part of #2274
+  is taken; its pointer-promotion and RemoteFX-buffer changes are not. Test:
+  `conn_test::hidden_and_default_pointer_updates_reach_the_client` (fails without the
+  fix; catches a dropped `index == 0` guard and a `First` fragment). **Drop it at the
+  next pin bump** (any rev at or after `904a7da6`).
+
+- **(32)** Added 2026-11-13 for clintcan/macrdp#186. The candidate path was already
+  bounded (`CANDIDATE_NEGOTIATION_TIMEOUT`, 10 s) and finalize by upstream's
+  `FINALIZE_TIMEOUT`, but `run_connection_inner` awaited `negotiate_and_authenticate`
+  with no bound, so a peer that sent a Connection Request and went silent held the
+  serving connection forever, pre-authentication. 60 s rather than 10 s because Windows
+  App for macOS prompts for the password inside this phase (7-11 s measured
+  accept-to-auth) and a cellular CredSSP took 12.5 s. Test:
+  `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused clock; fails
+  without the bound, and with a 30 s one). **Upstreamed** as Devolutions/IronRDP#2432,
+  merged 2026-11-14 (`e482e340`, 60 s `NEGOTIATION_TIMEOUT` around
+  `negotiate_and_authenticate`, covering every entry point). Drops at the next pin bump
+  to any rev at or after `e482e340`; keep the conn_test as the regression check.
+
+- **(33)** Added 2026-11-13 by clintcan/macrdp#201 (`--virtual-display-hidpi=auto`),
+  replacing that PR's own shared-cell divergence: upstream #2107 (by @antonmos) carries
+  the same values through `ConnectionInfo`, and macrdp's `conn_hooks::DesktopScaleHook`
+  stores them in the scale cell, as `KeyboardLayoutHook` does for the layout. Upstream
+  reports the pair only when both are valid (desktop 100..=500, device 100/140/180) and
+  only on the initial accept, so a reactivation can't overwrite a scale the client
+  announced later in a monitor layout. Copied from upstream's diff, not its file. Test:
+  `conn_hooks::tests::the_desktop_scale_factor_reaches_the_shared_cell`. **Drop it at
+  the next pin bump** (any rev at or after `335d6712`).
+
+- **(34)** Added 2026-10-21 (clintcan/macrdp#226). Numbered (34) because main used
+  (29) to (33) while this branch was open. MS-RDPRFX 3.1.8.3.1: "The sequence of
+  encode messages is encapsulated inside an Extended Bitmap Data structure ..., which
+  is encapsulated in a Stream Surface Bits Surface Command". Windows 10 mstsc
+  (10.0.19041.4717), A/B on the wire 2026-10-21:
+  - RemoteFX, id 3 (what mstsc gets when both are offered): Set Surface Bits =
+    **black** session (no error, input still flows); Stream Surface Bits = renders
+    and moves.
+  - ImageRemoteFX, id 5 (server offering only ImageRemoteFX): Set Surface Bits =
+    renders and moves (385 commands in 12 s); Stream Surface Bits = mstsc "An
+    internal error has occurred" after 4 commands (3 of 3 runs).
+
+  FreeRDP 3.30 `/rfx` offers only RemoteFX (id 3), so it cannot exercise id 5.
+  Upstream merged the same fix after our pin as Devolutions/IronRDP#2229
+  (`e20a2147`); this port uses its names and shape: `RemoteFxCodec::surface_bits_command`
+  sends Stream Surface Bits only for RemoteFX and only when the client sets
+  `STREAM_SURFACE_BITS` in its Surface Commands capability (MS-RDPBCGR 2.2.7.2.9), and
+  `pick_remotefx_codec` picks RemoteFX over ImageRemoteFX whatever the order of the
+  client's codec list (before, the last one in the list won). Tests:
+  `encoder::surface_command_tests` and `server::remotefx_codec_choice_tests` (upstream's
+  proptest replaced by fixed codec lists), run by CI (`cargo test --manifest-path
+  vendor/ironrdp-server/Cargo.toml --lib --features egfx`). **Drop it at the next pin
+  bump** (any rev at or after `e20a2147`).
+
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
   into the winner's. `dispatch_audio` adopts upstream's `is_ready()` check (drop
@@ -109,6 +170,22 @@ Notes on the port:
   **Behaviour change:** the rebased acceptor only offers multitransport when the client
   negotiated the MCS message channel (the old fork fell back to the I/O channel). mstsc
   sends it; a client that doesn't now silently gets no UDP offer.
+  **Regression found 2026-11-13 (silent lossy audio since v0.10.0):** on the message
+  channel, mstsc DOES answer the offer with `S_OK` (the June notes saw only tunnel
+  creation), and `mt_on_response` spent the connection's one Soft-Sync on an empty
+  request for the reliable tunnel. `mt_soft_sync_on_egfx` then found it claimed and
+  never migrated `AUDIO_PLAYBACK_LOSSY_DVC`, so mstsc dropped every wave streamed into
+  the tunnel; `--udp-migrate-egfx` went through the same one-shot. Fix: when a channel
+  is configured to migrate (`mt_has_channel_to_migrate`: lossy audio or EGFX), the
+  response leaves the Soft-Sync to the migration gate; otherwise it still gets the
+  empty one. Live-verified on mstsc (LAN): the Soft-Sync names the lossy audio DVC,
+  mstsc answers `tunnels_to_switch: [3]`, and audio plays. No automated test (the path
+  needs a real multitransport client). Follow-up the same day: waves stay on TCP
+  (`mt_route_lossy_audio` returns them to the static rdpsnd path) until the Soft-Sync
+  naming the lossy channel has been sent AND acknowledged
+  (`lossy_audio_soft_synced` + `DrdynvcServer::soft_sync_response_received`). Before,
+  they started ~0.5 s ahead of the Soft-Sync and that first half-second was dropped.
+  Live: audio from the first second, lossy streaming 4 ms after the client's response.
 - **(15)** A preemption winner's RTT is now sampled as a candidate (carried on
   `NegotiatedConnection.link_rtt_ms`); before, it inherited the previous connection's.
 - **(16)** Upstream made a completion's raw `TS_URB_RESULT` bytes private, so

@@ -1155,6 +1155,127 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+/// A test server like [`build_test_server_full`] (keep-alive sound, so a
+/// session stays up) with macrdp's real H.264 `Gfx` as its EGFX factory.
+fn build_test_server_with_gfx(port: u16, gfx: crate::h264::Gfx) -> RdpServer {
+    let display = TestDisplay {
+        size: ServerDesktopSize {
+            width: 1024,
+            height: 768,
+        },
+    };
+    RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, port))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(display)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_gfx_factory(Some(Box::new(gfx)))
+        // Without this the default `Queue` policy never starts a candidate, and
+        // the bare-connect assertion below would pass without testing anything.
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+fn test_gfx() -> crate::h264::Gfx {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    crate::h264::Gfx::new(
+        crate::capture::SharedDesktopSize::new(1024, 768),
+        30,
+        5_000_000,
+        2.0,
+        2,
+        0, // tcp_max_unacked_frames: off
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        true,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    )
+}
+
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+/// Wait (briefly) for the H.264 pipeline's active connection to become
+/// something other than `not`.
+async fn wait_for_active_connection(
+    gfx: &crate::h264::Gfx,
+    not: Option<usize>,
+) -> anyhow::Result<usize> {
+    for _ in 0..250 {
+        match gfx.active_connection() {
+            Some(id) if Some(id) != not => return Ok(id),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    anyhow::bail!("the H.264 pipeline never switched to a new connection")
+}
+
+/// A bare TCP connect during a live session must not touch the live session's
+/// H.264 state. The accept loop starts a preemption candidate for any peer
+/// `on_accept` lets through, and building the candidate's channels used to
+/// replace the process-wide EGFX context with a fresh, not-ready one — so the
+/// live session silently fell back to legacy bitmaps under its still-mapped
+/// EGFX surface, before the peer had sent a single byte. A candidate that does
+/// win must still get a fresh context of its own.
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+#[tokio::test]
+async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let gfx = test_gfx();
+            let mut server = build_test_server_with_gfx(addr.port(), gfx.clone());
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A: the live session.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+            let live = wait_for_active_connection(&gfx, None).await?;
+
+            // `nc`: connect, send nothing. The candidate's channels are built
+            // straight away, before it negotiates anything.
+            let bare = connect_with_retry(addr).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                gfx.active_connection(),
+                Some(live),
+                "a bare TCP connect replaced the live session's H.264 context"
+            );
+
+            // The bare peer goes away; the live session is still the one served.
+            drop(bare);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(gfx.active_connection(), Some(live));
+
+            // A real client that preempts gets a fresh context of its own.
+            let b = connect_with_retry(addr).await?;
+            let (_size_b, _framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("the preempting client was never served"))??;
+            let winner = wait_for_active_connection(&gfx, Some(live)).await?;
+            assert_ne!(winner, live);
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
@@ -1318,6 +1439,401 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
                 matches!(received, Ok(Some(_))),
                 "a key press sent while a server write was blocked never reached the input handler"
             );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A pointer update with no payload (hidden, default) must still reach the
+/// client. The fast-path fragmenter at our pin stopped on an empty payload
+/// and wrote nothing, so `HidePointer` and `DefaultPointer` were silently
+/// dropped (vendored server divergence 31, from upstream #2274).
+#[tokio::test]
+async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result<()> {
+    use ironrdp_core::{Decode as _, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, UpdateCode};
+
+    struct PointerUpdates(Vec<DisplayUpdate>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for PointerUpdates {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            if let Some(update) = self.0.pop() {
+                return Ok(Some(update));
+            }
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
+
+    struct PointerDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for PointerDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            // Popped from the back: hidden first, then default.
+            Ok(Box::new(PointerUpdates(vec![
+                DisplayUpdate::DefaultPointer,
+                DisplayUpdate::HidePointer,
+            ])))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(PointerDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, mut framed) = connect_client(client_io, 256, 256).await?;
+
+            let mut codes = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while codes.len() < 2 {
+                let Ok(read) = tokio::time::timeout_at(deadline, framed.read_pdu()).await else {
+                    break;
+                };
+                let (action, bytes) = read?;
+                if action != ironrdp_pdu::Action::FastPath {
+                    continue;
+                }
+                let mut cursor = ReadCursor::new(&bytes);
+                FastPathHeader::decode(&mut cursor)?;
+                while !cursor.is_empty() {
+                    let update = FastPathUpdatePdu::decode(&mut cursor)?;
+                    if matches!(
+                        update.update_code,
+                        UpdateCode::HiddenPointer | UpdateCode::DefaultPointer
+                    ) {
+                        // A First/Next fragment would leave a real client
+                        // waiting for the rest; it has to be one Single frame.
+                        assert_eq!(
+                            update.fragmentation,
+                            ironrdp_pdu::fast_path::Fragmentation::Single
+                        );
+                        codes.push(update.update_code);
+                    }
+                }
+            }
+            server_task.abort();
+            assert_eq!(
+                codes,
+                [UpdateCode::HiddenPointer, UpdateCode::DefaultPointer],
+                "empty-payload pointer updates never reached the client"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A peer that sends an X.224 Connection Request and then goes silent must not
+/// hold the serving connection forever (#186): the pre-finalize phase is
+/// bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s, vendored divergence 32). The
+/// clock is paused, so the wait is virtual.
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_cannot_hold_the_serving_connection() -> anyhow::Result<()> {
+    use ironrdp_pdu::nego::{ConnectionRequest, RequestFlags, SecurityProtocol};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::AsyncWriteExt as _;
+
+    init_tracing();
+    let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let request = X224(ConnectionRequest {
+                nego_data: None,
+                flags: RequestFlags::empty(),
+                protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+                correlation_info: None,
+            });
+            client_io.write_all(&ironrdp_core::encode_vec(&request)?).await?;
+            client_io.flush().await?;
+
+            // Still waiting just short of the budget: a slow human typing a
+            // password inside this phase must not be cut off early.
+            tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+            assert!(
+                !server_task.is_finished(),
+                "the serving connection gave up before the 60 s budget"
+            );
+
+            let done = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+            assert!(
+                done.is_ok(),
+                "a peer that went silent after its Connection Request still holds the serving connection"
+            );
+            drop(client_io);
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A do-nothing client DVC, so the client accepts the server's Create Request
+/// for the channel `NAME` names. The two audio channels need distinct types,
+/// because the client keys its pre-registered DVCs on the Rust type.
+struct NamedDvc<const LOSSY: bool>;
+
+impl<const LOSSY: bool> ironrdp_dvc::DvcProcessor for NamedDvc<LOSSY> {
+    fn channel_name(&self) -> &str {
+        if LOSSY {
+            "AUDIO_PLAYBACK_LOSSY_DVC"
+        } else {
+            "AUDIO_PLAYBACK_DVC"
+        }
+    }
+
+    fn start(&mut self, _channel_id: u32) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(
+        &mut self,
+        _channel_id: u32,
+        _payload: &[u8],
+    ) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl<const LOSSY: bool> ironrdp_dvc::DvcClientProcessor for NamedDvc<LOSSY> {}
+
+impl<const LOSSY: bool> ironrdp_core::AsAny for NamedDvc<LOSSY> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Offers the lossy (UdpFecL) tunnel, as `--enable-lossy-audio` does.
+struct LossyOffer;
+
+impl ironrdp_server::MultitransportProvider for LossyOffer {
+    fn requested_protocol(&self) -> ironrdp_pdu::rdp::multitransport::RequestedProtocol {
+        ironrdp_pdu::rdp::multitransport::RequestedProtocol::UdpFecL
+    }
+}
+
+/// Lossy UDP audio is only heard if the connection's one Soft-Sync request names
+/// `AUDIO_PLAYBACK_LOSSY_DVC` for the lossy tunnel. Since v0.10.0's IronRDP update,
+/// mstsc answers the UDP offer with `S_OK` on the message channel after the session
+/// is up, and macrdp spent the Soft-Sync on an empty request when that answer
+/// arrived: the audio channel never moved, and mstsc dropped every wave streamed
+/// into the tunnel (silent from v0.10.0 to v0.10.4, found by hand). This drives a
+/// real IronRDP client through that order of events: accept the lossy offer, bind
+/// the tunnel the way the UDP listener does (taking its cookie from the registry),
+/// answer `S_OK` again once the session is running, then let an EGFX event open the
+/// Soft-Sync gate.
+#[tokio::test]
+async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Result<()> {
+    use ironrdp_dvc::pdu::SoftSyncTunnelType;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_pdu::gcc::MultiTransportFlags;
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+    use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let registry = ironrdp_server::CookieRegistry::new();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.set_multitransport_provider(Some(Box::new(LossyOffer)));
+    server.set_multitransport_cookie_registry(Some(registry.clone()));
+    server.set_multitransport_lossy_audio_formats(Some(vec![ironrdp_rdpsnd::pdu::AudioFormat {
+        format: ironrdp_rdpsnd::pdu::WaveFormat::PCM,
+        n_channels: 2,
+        n_samples_per_sec: 44_100,
+        n_avg_bytes_per_sec: 176_400,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }]));
+    let events = server.event_sender().clone();
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            // Every 100 ms, the event that EGFX traffic raises. The gate retries
+            // until the lossy channel is open, and sends the Soft-Sync only once.
+            let egfx_ticks = tokio::task::spawn_local(async move {
+                loop {
+                    let _ = events.send(ironrdp_server::ServerEvent::Egfx(
+                        ironrdp_server::EgfxServerMessage::SendMessages {
+                            messages: Vec::new(),
+                        },
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+
+            let mut config = client_config(1024, 768);
+            config.multitransport_flags = Some(
+                MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                    | MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                    | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+            );
+            let mut drdynvc = DrdynvcClient::new()
+                .with_dynamic_channel(NamedDvc::<false>)
+                .with_dynamic_channel(NamedDvc::<true>);
+            drdynvc.enable_soft_sync_tunnel(SoftSyncTunnelType::LOSSY_UDP);
+            let mut connector =
+                ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_static_channel(drdynvc);
+
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+
+            let offered = std::rc::Rc::new(std::cell::Cell::new(None::<u32>));
+            let seen = std::rc::Rc::clone(&offered);
+            let bind = registry.clone();
+            let result = ironrdp_tokio::connect_finalize_with_multitransport(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+                async |request: ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu,
+                       _soft_sync| {
+                    seen.set(Some(request.request_id));
+                    // What the UDP listener does when the client's tunnel arrives.
+                    assert!(
+                        bind.take(&request.security_cookie).is_some(),
+                        "the offer's cookie was not registered with the listener"
+                    );
+                    Ok(ironrdp_connector::MultitransportResult::Success)
+                },
+            )
+            .await?;
+            let request_id = offered
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("the server never offered the lossy tunnel"))?;
+            let message_channel_id = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+            let user_channel_id = result.user_channel_id;
+            let mut channels = result.static_channels;
+            let drdynvc_id = channels
+                .get_channel_id_by_type::<DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("no DRDYNVC channel"))?;
+
+            // mstsc's order: S_OK on the message channel once the session is running.
+            let response = MultitransportResponsePdu {
+                security_header: BasicSecurityHeader {
+                    flags: BasicSecurityHeaderFlags::TRANSPORT_RSP,
+                },
+                request_id,
+                hr_response: MultitransportResponsePdu::S_OK,
+            };
+            let late_ok = ironrdp_core::encode_vec(&X224(SendDataRequest {
+                initiator_id: user_channel_id,
+                channel_id: message_channel_id,
+                user_data: ironrdp_core::encode_vec(&response)?.into(),
+            }))?;
+            framed.write_all(&late_ok).await?;
+
+            // Pump DRDYNVC until the client has processed the Soft-Sync request.
+            let pumped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != drdynvc_id {
+                        continue;
+                    }
+                    let svc = channels
+                        .get_by_channel_id_mut(drdynvc_id)
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC disappeared"))?;
+                    let replies = svc.process(&data.user_data)?;
+                    if !replies.is_empty() {
+                        let bytes = ironrdp_svc::client_encode_svc_messages(
+                            replies,
+                            drdynvc_id,
+                            user_channel_id,
+                        )?;
+                        framed.write_all(&bytes).await?;
+                    }
+                    let client = svc
+                        .channel_processor_downcast_ref::<DrdynvcClient>()
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC is not the client processor"))?;
+                    if client.soft_sync_complete() {
+                        let lossy = client.get_dvc::<NamedDvc<true>>().map(|c| c.channel_id());
+                        return anyhow::Ok(lossy.and_then(|id| client.tunnel_for_channel(id)));
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the server never sent a Soft-Sync request"))??;
+
+            assert_eq!(
+                pumped,
+                Some(SoftSyncTunnelType::LOSSY_UDP),
+                "the Soft-Sync did not move AUDIO_PLAYBACK_LOSSY_DVC onto the lossy tunnel"
+            );
+
+            egfx_ticks.abort();
+            server_task.abort();
             anyhow::Ok(())
         })
         .await

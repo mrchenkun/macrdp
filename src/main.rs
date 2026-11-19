@@ -13,6 +13,7 @@ mod audin;
 mod audio;
 mod auth;
 mod auth_guard;
+mod auth_status;
 mod avc444;
 mod camera;
 mod capture;
@@ -28,6 +29,7 @@ mod file_promise;
 mod file_promise_lazy;
 #[cfg(target_os = "macos")]
 mod h264;
+mod h264_sps;
 mod health;
 mod input;
 mod keyboard_layout;
@@ -323,6 +325,23 @@ struct Args {
     #[arg(long)]
     virtual_display: bool,
 
+    /// Make the virtual display a Retina-style HiDPI display: the session
+    /// size (--width/--height, or the size the client requests) is its pixel
+    /// count, and macOS lays the UI out at HALF that in points — so a client
+    /// asking for 3456×2168 gets a sharp desktop that looks like 1728×1084,
+    /// instead of tiny UI. Set --width/--height (VD_WIDTH/VD_HEIGHT) to twice
+    /// the size you want the UI to look. Costs ~4× the pixels of the same
+    /// apparent size without it (heavier encode, decode and bandwidth).
+    /// Only valid with --virtual-display. macOS-only.
+    /// `auto` keeps the display HiDPI and picks the UI scale per connection
+    /// from the desktop scale factor the client announces: a 2× client
+    /// (Windows App with "Optimize for Retina displays" sends 200) gets the UI
+    /// at half its size, any other client at its own size, captured down from
+    /// the 2× backing — normal-size UI either way. Config: VD_HIDPI=1 or
+    /// VD_HIDPI=auto.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "on")]
+    virtual_display_hidpi: Option<VdHidpiArg>,
+
     /// Promote the virtual display to be the system's primary display
     /// for the duration of the run — the one with the menu bar, where
     /// new app windows open. Use this when you want to drive the
@@ -500,6 +519,20 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
+    /// Cap how far the server may run ahead of the client's frame
+    /// acknowledgements on the TCP path (only with --enable-h264): once more
+    /// than N shipped frames are unacknowledged, captures are dropped (with a
+    /// 10 fps trickle so the client keeps presenting) until it catches up.
+    /// Without it, a client that decodes at roughly the rate we send builds a
+    /// backlog on every burst that can take seconds to drain — felt as
+    /// hundreds of ms of input lag. 0 (default) = off, the TCP path relies on
+    /// socket backpressure alone. Try 3–4. The --flush-frames re-sends are
+    /// exempt, so the last change before a pause still shows. The EGFX-over-UDP
+    /// path has its own always-on version (MACRDP_UDP_EGFX_MAX_FRAME_LAG).
+    /// Config: H264_MAX_UNACKED_FRAMES.
+    #[arg(long, default_value_t = 0)]
+    h264_max_unacked_frames: u32,
+
     /// Number of trailing "flush" frames re-sent after the last on-screen change
     /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
     /// static screen, so the last change before a pause (e.g. the final
@@ -511,6 +544,16 @@ struct Args {
     /// trailing lag remains; set 0 to disable the flush burst entirely.
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
+
+    /// EXPERIMENTAL (only with --enable-h264): have ScreenCaptureKit deliver
+    /// full-range BT.709 NV12 and hand those buffers straight to VideoToolbox,
+    /// instead of BGRA that macrdp converts to NV12 on the CPU every frame.
+    /// Measured at a 3456x2168 virtual display: 14.3 → 3.3 ms of CPU per
+    /// encoded frame. Frames that still go out as legacy bitmaps (before H.264
+    /// is up, or a client without AVC) are converted back to BGRA on the CPU.
+    /// Config: CAPTURE_NV12.
+    #[arg(long)]
+    capture_nv12: bool,
 
     /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
     /// temp files are pre-sized but empty when the Windows copy lands,
@@ -775,6 +818,13 @@ struct Args {
     #[arg(long = "alt-space-spotlight")]
     alt_space_spotlight: bool,
 
+    /// Deliver Option+Q (Alt+Q from the client) as Cmd+Q, so a Windows client
+    /// can quit the focused Mac app without the Windows key. Off by default
+    /// (then Option+Q reaches remote apps as a normal key). Plain Option only:
+    /// Option+Shift+Q is NOT turned into Cmd+Shift+Q (log out). macOS-only.
+    #[arg(long = "alt-q-quit")]
+    alt_q_quit: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -801,6 +851,14 @@ struct Args {
     /// Cmd+C, the app's native macOS copy). No effect without --map-ctrl-to-cmd.
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
+
+    /// Reverse the mouse-wheel direction (vertical and horizontal) for the
+    /// remote session. For a Mac with natural scrolling on: macOS applies it to
+    /// macrdp's scroll events too, and a local tool that un-reverses the
+    /// physical wheel (LinearMouse etc.) doesn't see them. Off by default.
+    /// macOS-only.
+    #[arg(long = "reverse-scroll")]
+    reverse_scroll: bool,
 
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
@@ -1243,6 +1301,15 @@ struct TlsMaterial {
     cert_der: Vec<u8>,
     /// Private-key DER, same purpose as `cert_der`.
     key_der: Vec<u8>,
+}
+
+/// `--virtual-display-hidpi` values (the bare flag means `on`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum VdHidpiArg {
+    /// Always HiDPI.
+    On,
+    /// HiDPI only for a client that announces a 2× desktop scale factor.
+    Auto,
 }
 
 /// Expiry classification for an operator-supplied cert. Pure (testable) split
@@ -2353,6 +2420,16 @@ fn boost_thread_qos() {
 }
 
 fn main() -> Result<()> {
+    // One-shot helper mode for the virtual display (see
+    // `virtual_display::SELECT_MODE_ARG`); never reaches the server.
+    #[cfg(target_os = "macos")]
+    {
+        let mut argv = std::env::args().skip(1);
+        if argv.next().as_deref() == Some(virtual_display::SELECT_MODE_ARG) {
+            let spec = argv.next().unwrap_or_default();
+            std::process::exit(virtual_display::run_select_mode_helper(&spec));
+        }
+    }
     // Build the tokio runtime explicitly so every worker thread starts
     // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
     // generated runtime gives us no hook for this. Crucially: the main
@@ -2484,6 +2561,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_SPACE_SPOTLIGHT", false) {
         argv.push("--alt-space-spotlight".into());
     }
+    if on("ALT_Q_QUIT", false) {
+        argv.push("--alt-q-quit".into());
+    }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
@@ -2502,8 +2582,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("CAPTURE_NV12", false) {
+        argv.push("--capture-nv12".into());
+    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
+    }
+    if on("REVERSE_SCROLL", false) {
+        argv.push("--reverse-scroll".into());
     }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
@@ -2544,6 +2630,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(get("VD_WIDTH", "1920"));
         argv.push("--height".into());
         argv.push(get("VD_HEIGHT", "1080"));
+        if get("VD_HIDPI", "0").eq_ignore_ascii_case("auto") {
+            argv.push("--virtual-display-hidpi=auto".into());
+        } else if on("VD_HIDPI", false) {
+            argv.push("--virtual-display-hidpi".into());
+        }
         // Back-compat: old configs set CAPTURE_PRIMARY=1 with no PRIMARY_MODE.
         let mut primary_mode = get("PRIMARY_MODE", "none");
         if primary_mode == "none" && on("CAPTURE_PRIMARY", false) {
@@ -2585,6 +2676,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push("--key".into());
             argv.push(path.clone());
         }
+    }
+    if let Some(n) = cfg.get("H264_MAX_UNACKED_FRAMES").filter(|n| !n.is_empty()) {
+        argv.push("--h264-max-unacked-frames".into());
+        argv.push(n.clone());
     }
     if let Some(sz) = cfg.get("MAX_CLIENT_SIZE") {
         if !sz.is_empty() {
@@ -2669,6 +2764,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "BLANK_RECOVERY_HEAL_CONFIRM_MS",
             "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
         ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+        ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
         (
@@ -2743,8 +2846,40 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
+/// Log a startup credential failure once and write the auth-status file the
+/// controller reads (#266). The caller then waits and re-reads the password
+/// instead of exiting into a launchd KeepAlive restart loop.
+fn report_auth_failure(
+    err: &anyhow::Error,
+    failure: auth_status::Failure,
+    username: &str,
+    status_dir: &Option<PathBuf>,
+) {
+    error!(
+        error = format!("{err:#}"),
+        reason = failure.code(),
+        user = %username,
+        "cannot start: no valid password for this Mac account. Waiting, and checking \
+         again only when the stored password changes, so the account doesn't collect \
+         failed logins. Re-enter it in the macrdp menu-bar controller, or fix the \
+         Keychain entry"
+    );
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::write(dir, failure, username) {
+            warn!(error = %e, "could not write the auth-status file for the controller");
+        }
+    }
+}
+
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
+    // Where the auth-status file goes for the controller (#266): beside the
+    // config file when there is one, else the default config directory.
+    let status_dir: Option<PathBuf> = args
+        .config
+        .as_deref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| default_cert_dir().ok());
     // If launched with `--config <file>` (the LaunchAgent path), the file is the
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
@@ -2838,6 +2973,11 @@ async fn async_main() -> Result<()> {
         tokio::spawn(crate::stats::serve(port, stats));
     }
 
+    if args.virtual_display_hidpi.is_some() && !args.virtual_display {
+        return Err(anyhow!(
+            "--virtual-display-hidpi requires --virtual-display"
+        ));
+    }
     if args.make_primary && !args.virtual_display {
         return Err(anyhow!(
             "--make-primary requires --virtual-display (it promotes the \
@@ -2983,6 +3123,116 @@ async fn async_main() -> Result<()> {
         std::process::exit(0);
     });
 
+    // Credentials first (#266): read and check the password BEFORE any setup
+    // with side effects (sleep blocker, virtual display, helper processes), so a
+    // wrong password costs nothing but the check itself. Under launchd a failure
+    // does not exit: KeepAlive would restart it every ~10 s, each restart another
+    // failed check against the Mac account. See src/auth_status.rs.
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    // Only the Keychain and a password file can change while we wait; the
+    // terminal prompt and --password are one-shot, so they never wait.
+    let pollable = args.keychain || args.password_file.is_some();
+    let park = pollable
+        && auth_status::should_park(
+            std::io::stdout().is_terminal(),
+            std::env::var("MACRDP_PARK_ON_AUTH_FAILURE").ok().as_deref(),
+        );
+    let mut cli_password = args.password.take();
+    // The password the account check last rejected. While parked, PAM runs
+    // again only once the stored password differs from it, so waiting adds no
+    // failed logins; a missing or unreadable password is re-read with no PAM.
+    let mut rejected: Option<Zeroizing<String>> = None;
+    let mut reported: Option<auth_status::Failure> = None;
+    let password: Zeroizing<String> = loop {
+        let read: Result<Zeroizing<String>> = if args.keychain {
+            read_password_from_keychain(&username)
+        } else if let Some(path) = args.password_file.as_deref() {
+            read_password_file(path)
+        } else if let Some(p) = cli_password.take() {
+            warn!(
+                "--password is visible to any local user via `ps` and may be saved in \
+                 shell history; prefer --keychain (headless) or the interactive prompt. \
+                 Kept only for compatibility / scripted tests."
+            );
+            Ok(Zeroizing::new(p))
+        } else {
+            rpassword::prompt_password(format!("Password for {username}: "))
+                .map(Zeroizing::new)
+                .context("read password from terminal")
+        };
+        let (failure, err) = match read {
+            Err(e) => (auth_status::Failure::NoPassword, e),
+            Ok(p) => {
+                if !auth_status::should_check(rejected.as_ref().map(|r| r.as_str()), &p) {
+                    // Same password the check already rejected: no new check,
+                    // keep waiting (the report below runs only on a change of
+                    // reason, e.g. after the entry briefly went missing).
+                    (
+                        auth_status::Failure::WrongPassword,
+                        anyhow!("the stored password is still the one the account check rejected"),
+                    )
+                } else if args.skip_auth {
+                    break p;
+                } else {
+                    if rejected.is_some() {
+                        info!(user = %username, "the stored password changed — checking it again");
+                    }
+                    match auth::authenticate(&username, p.as_str())
+                        .with_context(|| format!("PAM auth failed for {username}"))
+                    {
+                        Ok(()) => {
+                            info!(user = %username, "PAM auth ok");
+                            break p;
+                        }
+                        Err(e) => {
+                            rejected = Some(p);
+                            (auth_status::Failure::WrongPassword, e)
+                        }
+                    }
+                }
+            }
+        };
+        if !park {
+            return Err(err);
+        }
+        if reported != Some(failure) {
+            report_auth_failure(&err, failure, &username, &status_dir);
+            reported = Some(failure);
+        }
+        tokio::time::sleep(auth_status::POLL_INTERVAL).await;
+    };
+    if reported.is_some() {
+        info!(user = %username, "a valid password is available now — starting");
+    }
+    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
+    // exact validated credential without a second Keychain read — works
+    // identically regardless of which branch above produced it.
+    let password: Arc<Zeroizing<String>> = Arc::new(password);
+    if args.skip_auth {
+        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
+        // listener is reachable beyond loopback so a fat-fingered config
+        // can't accidentally expose an unauth'd RDP server to the LAN.
+        if !args.bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "--skip-auth refused on non-loopback bind {} — \
+                 remove --skip-auth or rebind to 127.0.0.1",
+                args.bind,
+            ));
+        }
+        warn!(
+            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
+        );
+    }
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::clear(dir) {
+            warn!(error = %e, "could not remove the stale auth-status file");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         if !args.allow_sleep {
@@ -3023,6 +3273,14 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
 
+    // The client's desktop scale factor, filled by the server per connection;
+    // only consulted (and only wired to the server) for --virtual-display-hidpi=auto.
+    let client_scale_factor = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let vd_hidpi = match args.virtual_display_hidpi {
+        None => virtual_display::HidpiPolicy::Off,
+        Some(VdHidpiArg::On) => virtual_display::HidpiPolicy::On,
+        Some(VdHidpiArg::Auto) => virtual_display::HidpiPolicy::Auto(client_scale_factor.clone()),
+    };
     let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
         if args.virtual_display {
             let w = args
@@ -3034,12 +3292,22 @@ async fn async_main() -> Result<()> {
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
             // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-                .context("attaching virtual display")?;
+            let vd = virtual_display::VirtualDisplay::new(
+                u32::from(w),
+                u32::from(h),
+                60,
+                vd_hidpi.capable(),
+                // Before any client: --width/--height are Retina pixels (the
+                // UI at half that), for `auto` too. Each connection then picks
+                // its own UI scale in `CaptureDisplay::sync_virtual_display`.
+                if vd_hidpi.capable() { 2 } else { 1 },
+            )
+            .context("attaching virtual display")?;
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
                 size = ?vd.size_pts(),
+                hidpi = virtual_display::is_hidpi_virtual_display(vd.display_id()),
                 "virtual display attached — the RDP session uses this surface; \
                  your primary panel is untouched"
             );
@@ -3054,51 +3322,6 @@ async fn async_main() -> Result<()> {
     // guard on 0→≥1 client transitions and drops it on ≥1→0. Both
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password: Zeroizing<String> = if args.keychain {
-        read_password_from_keychain(&username)?
-    } else if let Some(path) = args.password_file.as_deref() {
-        read_password_file(path)?
-    } else if let Some(p) = args.password.take() {
-        warn!(
-            "--password is visible to any local user via `ps` and may be saved in \
-             shell history; prefer --keychain (headless) or the interactive prompt. \
-             Kept only for compatibility / scripted tests."
-        );
-        Zeroizing::new(p)
-    } else {
-        Zeroizing::new(
-            rpassword::prompt_password(format!("Password for {username}: "))
-                .context("read password from terminal")?,
-        )
-    };
-    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
-    // exact validated credential without a second Keychain read — works
-    // identically regardless of which branch above produced it.
-    let password: Arc<Zeroizing<String>> = Arc::new(password);
-    if !args.skip_auth {
-        auth::authenticate(&username, password.as_str())
-            .with_context(|| format!("PAM auth failed for {username}"))?;
-        info!(user = %username, "PAM auth ok");
-    } else {
-        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
-        // listener is reachable beyond loopback so a fat-fingered config
-        // can't accidentally expose an unauth'd RDP server to the LAN.
-        if !args.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "--skip-auth refused on non-loopback bind {} — \
-                 remove --skip-auth or rebind to 127.0.0.1",
-                args.bind,
-            ));
-        }
-        warn!(
-            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
-        );
-    }
 
     let session_tracker = capture::SessionTracker::default();
     // (--lock-on-disconnect) Connection activity the pending lock consults so
@@ -3345,24 +3568,33 @@ async fn async_main() -> Result<()> {
              For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
              Thincast) pass --enable-h264 (AVC420 over EGFX)."
         );
+        if args.capture_nv12 {
+            warn!("--capture-nv12 has no effect without --enable-h264; capturing BGRA");
+        }
     }
 
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
+    crate::input::set_alt_q_quit(args.alt_q_quit);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    crate::input::set_reverse_scroll(args.reverse_scroll);
+    if args.reverse_scroll {
+        info!("mouse-wheel direction reversed (--reverse-scroll)");
+    }
     if args.map_ctrl_to_cmd {
         info!(
             no_remap_apps = ?args.no_remap_apps,
             "Ctrl→Cmd Windows-shortcut remap enabled (--map-ctrl-to-cmd)"
         );
-        // Event-driven frontmost-app tracking for the terminal/app suppression
-        // (catches click-focus + Electron apps that AX polling misses).
-        crate::input::init_focus_observer();
     }
+    // Event-driven frontmost-app tracking (catches activations AX polling
+    // misses). Feeds the Ctrl→Cmd terminal suppression AND the app switcher's
+    // MRU, so it's armed regardless of --map-ctrl-to-cmd.
+    crate::input::init_focus_observer();
 
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held
@@ -3424,6 +3656,7 @@ async fn async_main() -> Result<()> {
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
+            args.h264_max_unacked_frames,
             egfx_on_lossy_flag.clone(),
             egfx_on_udp_flag.clone(),
             egfx_demigrate_flag.clone(),
@@ -3475,6 +3708,7 @@ async fn async_main() -> Result<()> {
         keyframe_on_change,
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
+        capture_nv12: args.capture_nv12,
         display_suppressed: Some(display_suppressed.clone()),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
@@ -3487,6 +3721,8 @@ async fn async_main() -> Result<()> {
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
+        vd_hidpi: vd_hidpi.clone(),
+        pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale())),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
@@ -3607,6 +3843,11 @@ async fn async_main() -> Result<()> {
     hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
         keyboard_layout_klid,
     )));
+    // `--virtual-display-hidpi=auto` sizes the virtual display from the
+    // desktop scale factor the connecting client announces.
+    if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
+        hooks.push(Box::new(conn_hooks::DesktopScaleHook(client_scale_factor)));
+    }
     // With --stats-endpoint, clear the per-session stats when a connection ends.
     if let Some(stats) = stats::global() {
         hooks.push(Box::new(conn_hooks::StatsHook(Arc::clone(stats))));
@@ -4085,6 +4326,16 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn reverse_scroll_config_bridge() {
+        let p = write_temp("rs1", "REVERSE_SCROLL=1\n");
+        assert!(args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+        let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
+        assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
     }
 
     #[test]

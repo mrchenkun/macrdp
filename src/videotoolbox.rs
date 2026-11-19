@@ -67,6 +67,28 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
+    /// The periodic keyframe interval in frames, enforced HERE by
+    /// [`Encoder::encode_bgra`], not by VideoToolbox (see [`VT_KEYFRAME_BACKSTOP`]).
+    keyframe_interval: u32,
+    /// Frames encoded since the last keyframe, counting that keyframe.
+    frames_since_keyframe: u32,
+}
+
+/// The `MaxKeyFrameInterval` handed to VideoToolbox at session creation: high
+/// enough never to fire, so [`Encoder::encode_bgra`] alone schedules the
+/// periodic keyframes. VideoToolbox fixes the interval when the session is
+/// created and silently ignores later changes: measured 2026-11-13, a session
+/// made with a 6-frame interval still emitted a keyframe every 6 frames after
+/// `MaxKeyFrameInterval` was set to 36000 (the set returned success). That made
+/// the adaptive controller's keyframe backoff a no-op, so the periodic IDR kept
+/// landing on a congested link. ~24 h at 60 fps; a backstop, not a schedule.
+const VT_KEYFRAME_BACKSTOP: u32 = 5_000_000;
+
+/// Whether the periodic keyframe is due: `frames_since_keyframe` counts the
+/// last keyframe, so with an interval of N the keyframes land on frames
+/// 0, N, 2N, … Pure; unit-tested.
+fn keyframe_due(frames_since_keyframe: u32, interval: u32) -> bool {
+    frames_since_keyframe >= interval.max(1)
 }
 
 impl Encoder {
@@ -97,7 +119,8 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let session =
+            ffi::create_session(width, height, bitrate_bps, VT_KEYFRAME_BACKSTOP, tx_ptr)?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -107,6 +130,9 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
+            keyframe_interval: keyframe_frames,
+            // Due at once: the first frame is a keyframe either way.
+            frames_since_keyframe: keyframe_frames,
         })
     }
 
@@ -126,12 +152,14 @@ impl Encoder {
         unsafe { ffi::set_average_bitrate(self.inner.session, bitrate_bps) }
     }
 
-    /// Live-update the periodic keyframe (IDR) interval (in frames), for
-    /// congestion-responsive IDR backoff (`h264.rs`). Stretch it under congestion to
-    /// suppress the periodic IDR; restore on recovery. No encoder rebuild.
-    pub fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
-        // SAFETY: `self.inner.session` is valid for the lifetime of the Encoder.
-        unsafe { ffi::set_max_keyframe_interval(self.inner.session, keyframe_frames) }
+    /// Change the periodic keyframe (IDR) interval (in frames), for
+    /// congestion-responsive IDR backoff (`h264.rs`): stretch it under congestion
+    /// to suppress the periodic IDR, restore it on recovery. Takes effect on the
+    /// next frame, because this encoder schedules the keyframes itself (see
+    /// [`VT_KEYFRAME_BACKSTOP`] for why VideoToolbox can't). Shrinking it below the
+    /// frames already encoded since the last keyframe makes the next frame one.
+    pub fn set_keyframe_interval(&mut self, keyframe_frames: u32) {
+        self.keyframe_interval = keyframe_frames.max(1);
     }
 
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
@@ -164,6 +192,13 @@ impl Encoder {
         }
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
+        let due = keyframe_due(self.frames_since_keyframe, self.keyframe_interval);
+        let force_keyframe = force_keyframe || due;
+        self.frames_since_keyframe = if force_keyframe {
+            1
+        } else {
+            self.frames_since_keyframe.saturating_add(1)
+        };
         ffi::encode_frame(
             &self.inner,
             bgra,
@@ -175,6 +210,42 @@ impl Encoder {
             force_keyframe,
             self.full_range,
         )
+    }
+
+    /// Submit a capture-owned full-range NV12 (`420f`) pixel buffer for
+    /// encoding — the zero-conversion path, where ScreenCaptureKit did the
+    /// BGRA→Y'CbCr conversion on the GPU. VT retains the buffer until the
+    /// encode completes, so the caller can drop its reference right after.
+    /// The buffer must match the encoder's size and be `420f`; anything else
+    /// is refused rather than encoded wrong.
+    pub fn encode_pixel_buffer(
+        &mut self,
+        pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let pixel_buffer = pixel_buffer.as_ptr() as *const c_void;
+        // SAFETY: `pixel_buffer` comes from a live, retained `CVPixelBuffer`
+        // borrowed for the whole call.
+        let (w, h, fmt) = unsafe {
+            (
+                ffi::CVPixelBufferGetWidth(pixel_buffer),
+                ffi::CVPixelBufferGetHeight(pixel_buffer),
+                ffi::CVPixelBufferGetPixelFormatType(pixel_buffer),
+            )
+        };
+        if w != usize::from(self.width) || h != usize::from(self.height) {
+            bail!(
+                "NV12 pixel buffer is {w}x{h}, encoder is {}x{}",
+                self.width,
+                self.height
+            );
+        }
+        if fmt != ffi::K_CV_PIXEL_FORMAT_TYPE_420F {
+            bail!("pixel buffer format {fmt:#010x} is not full-range NV12 ('420f')");
+        }
+        let pts = self.next_pts;
+        self.next_pts = self.next_pts.wrapping_add(1);
+        ffi::submit_to_vt(&self.inner, pixel_buffer, pts, self.fps, force_keyframe)
     }
 
     /// Pull every encoded frame the callback has produced so far.
@@ -205,6 +276,33 @@ impl Encoder {
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
 unsafe impl Send for Encoder {}
+
+/// Convert a locked full-range BT.709 NV12 (`420f`) frame to tightly packed
+/// BGRA (`width * 4` bytes per row) in `out`, resizing it as needed. Used by
+/// the NV12 capture mode for frames that still ship as legacy bitmaps.
+#[allow(clippy::too_many_arguments)]
+pub fn nv12_full_range_to_bgra(
+    y_plane: &[u8],
+    y_stride: usize,
+    cbcr_plane: &[u8],
+    cbcr_stride: usize,
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let dst_stride = width * 4;
+    out.resize(dst_stride * height, 0);
+    ffi::nv12_full_range_to_bgra_vimage(
+        y_plane,
+        y_stride,
+        cbcr_plane,
+        cbcr_stride,
+        width,
+        height,
+        out,
+        dst_stride,
+    )
+}
 
 mod ffi {
     use super::EncodedFrame;
@@ -342,6 +440,9 @@ mod ffi {
             pixel_buffer_attributes: CFDictionaryRef,
             pixel_buffer_out: *mut CVPixelBufferRef,
         ) -> i32;
+        pub(super) fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
+        pub(super) fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
+        pub(super) fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> OSType;
         pub(super) fn CVPixelBufferLockBaseAddress(
             pixel_buffer: CVPixelBufferRef,
             lock_flags: u64,
@@ -538,7 +639,10 @@ mod ffi {
             // faster recovery, higher = smoother typing. The session's first
             // keyframe is still forced explicitly in encode_bgra(); this governs
             // only the periodic safety net. (Was fps*30 ≈ 30s, which let mstsc
-            // corruption persist for half a minute.) Set via --keyframe-interval
+            // corruption persist for half a minute.) Since 2026-11-13 the caller
+            // passes VT_KEYFRAME_BACKSTOP here and Encoder::encode_bgra schedules
+            // the periodic keyframe itself, because VideoToolbox ignores a later
+            // change to this property. The interval comes from --keyframe-interval
             // (seconds), already converted to a frame count by the caller.
             set_i32(
                 session,
@@ -567,23 +671,6 @@ mod ffi {
             session,
             kVTCompressionPropertyKey_AverageBitRate,
             bitrate_bps.max(1) as i32,
-        )
-    }
-
-    /// Live-update the periodic keyframe (IDR) interval, in frames, on a running
-    /// session — for congestion-responsive IDR backoff. Settable mid-session: under
-    /// congestion we stretch it (effectively suppressing the periodic IDR, since a
-    /// big intra frame is the worst thing to inject into a backed-up tunnel) and
-    /// restore it on recovery. *Forced* keyframes (first frame, recovery) are
-    /// independent — they go through `encode_bgra(force_keyframe=true)`.
-    pub(super) unsafe fn set_max_keyframe_interval(
-        session: VTCompressionSessionRef,
-        keyframe_frames: u32,
-    ) -> Result<()> {
-        set_i32(
-            session,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval,
-            keyframe_frames.max(1) as i32,
         )
     }
 
@@ -847,6 +934,136 @@ mod ffi {
         Ok(())
     }
 
+    // --- vImage full-range NV12 -> BGRA (legacy fallback for NV12 capture) ----
+    //
+    // When ScreenCaptureKit delivers NV12 (`--capture-nv12`), frames that still
+    // go out as legacy BitmapUpdates (before EGFX is ready, or a no-AVC client)
+    // need BGRA back. Inverse of the conversion above: same BT.709 matrix, same
+    // full-range pixel range.
+
+    /// `vImage_YpCbCrToARGB` — opaque 128-byte, 16-aligned conversion descriptor.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct VImageYpCbCrToArgb {
+        opaque: [u8; 128],
+    }
+
+    /// `vImage_YpCbCrToARGBMatrix` — opaque; only a pointer to the framework's
+    /// BT.709 constant is ever held.
+    #[repr(C)]
+    struct VImageYpCbCrToArgbMatrix {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        static kvImage_YpCbCrToARGBMatrix_ITU_R_709_2: *const VImageYpCbCrToArgbMatrix;
+        fn vImageConvert_YpCbCrToARGB_GenerateConversion(
+            matrix: *const VImageYpCbCrToArgbMatrix,
+            pixel_range: *const VImageYpCbCrPixelRange,
+            out_info: *mut VImageYpCbCrToArgb,
+            in_ypcbcr_type: u32,
+            out_argb_type: u32,
+            flags: u32,
+        ) -> isize;
+        fn vImageConvert_420Yp8_CbCr8ToARGB8888(
+            src_yp: *const VImageBuffer,
+            src_cbcr: *const VImageBuffer,
+            dest: *const VImageBuffer,
+            info: *const VImageYpCbCrToArgb,
+            permute_map: *const u8,
+            alpha: u8,
+            flags: u32,
+        ) -> isize;
+    }
+
+    fn vimage_inverse_conv_info() -> Option<&'static VImageYpCbCrToArgb> {
+        static INFO: std::sync::OnceLock<Option<VImageYpCbCrToArgb>> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| {
+            let range = VImageYpCbCrPixelRange {
+                yp_bias: 0,
+                cbcr_bias: 128,
+                yp_range_max: 255,
+                cbcr_range_max: 255,
+                yp_max: 255,
+                yp_min: 0,
+                cbcr_max: 255,
+                cbcr_min: 0,
+            };
+            let mut info = VImageYpCbCrToArgb { opaque: [0u8; 128] };
+            let err = unsafe {
+                vImageConvert_YpCbCrToARGB_GenerateConversion(
+                    kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
+                    &range,
+                    &mut info,
+                    K_VIMAGE_420YP8_CBCR8,
+                    K_VIMAGE_ARGB8888,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            (err == 0).then_some(info)
+        })
+        .as_ref()
+    }
+
+    /// Full-range BT.709 NV12 -> BGRA (opaque alpha) via vImage.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn nv12_full_range_to_bgra_vimage(
+        y_plane: &[u8],
+        y_stride: usize,
+        cbcr_plane: &[u8],
+        cbcr_stride: usize,
+        width: usize,
+        height: usize,
+        bgra: &mut [u8],
+        dst_stride: usize,
+    ) -> Result<()> {
+        if y_plane.len() < y_stride * height
+            || cbcr_plane.len() < cbcr_stride * (height / 2)
+            || bgra.len() < dst_stride * height
+        {
+            bail!("NV12->BGRA: plane or destination too small for {width}x{height}");
+        }
+        let info = vimage_inverse_conv_info()
+            .ok_or_else(|| anyhow!("vImage inverse conv-info unavailable"))?;
+        let src_yp = VImageBuffer {
+            data: y_plane.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: y_stride,
+        };
+        let src_cbcr = VImageBuffer {
+            data: cbcr_plane.as_ptr() as *mut c_void,
+            height: height / 2,
+            width: width / 2,
+            row_bytes: cbcr_stride,
+        };
+        let dest = VImageBuffer {
+            data: bgra.as_mut_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: dst_stride,
+        };
+        // vImage writes A,R,G,B; permuteMap[dest] = source channel, so
+        // {3,2,1,0} lays the bytes out as B,G,R,A.
+        let permute: [u8; 4] = [3, 2, 1, 0];
+        let err = unsafe {
+            vImageConvert_420Yp8_CbCr8ToARGB8888(
+                &src_yp,
+                &src_cbcr,
+                &dest,
+                info,
+                permute.as_ptr(),
+                255,
+                K_VIMAGE_NO_FLAGS,
+            )
+        };
+        if err != 0 {
+            bail!("vImageConvert_420Yp8_CbCr8ToARGB8888 failed: {err}");
+        }
+        Ok(())
+    }
+
     // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
     //
     // Two reference implementations of full-resolution chroma conversion, kept
@@ -1090,7 +1307,22 @@ mod ffi {
                 }
             }
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
+            submit_to_vt(guard, pbuf, pts, fps, force_keyframe)
+        };
+        unsafe { CFRelease(pbuf) };
+        result
+    }
 
+    /// Hand one pixel buffer to the VT session (async). VT retains `pbuf` for
+    /// the encode, so the caller keeps ownership of its own reference.
+    pub(super) fn submit_to_vt(
+        guard: &SessionGuard,
+        pbuf: CVPixelBufferRef,
+        pts: i64,
+        fps: u32,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        unsafe {
             let presentation = CMTime {
                 value: pts,
                 timescale: i32::try_from(fps).unwrap_or(30),
@@ -1138,9 +1370,7 @@ mod ffi {
             } else {
                 Ok(())
             }
-        };
-        unsafe { CFRelease(pbuf) };
-        result
+        }
     }
 
     #[allow(dead_code)] // only reached via Encoder::flush (shutdown / tests)
@@ -1240,7 +1470,9 @@ mod ffi {
                         break;
                     }
                     let slice = std::slice::from_raw_parts(ptr_out, size_out);
-                    parameter_sets.push(slice.to_vec());
+                    // Windows 10 mstsc shows a black screen unless the SPS
+                    // states the decode buffering (see h264_sps.rs).
+                    parameter_sets.push(crate::h264_sps::fix_parameter_set(slice));
                     index += 1;
                     if count_out > 0 && index >= count_out {
                         break;
@@ -1345,6 +1577,45 @@ mod tests {
                 cbcr_s[1],
                 cbcr_v[1]
             );
+        }
+    }
+
+    /// The NV12 capture mode's legacy fallback converts back to BGRA; it must
+    /// invert the encoder's conversion. BGRA -> NV12 -> BGRA on solid colours
+    /// (4:2:0 exact) lands within rounding of the original, which also pins the
+    /// output byte order (a swapped permute turns red into blue here).
+    #[test]
+    fn nv12_to_bgra_inverts_the_encoder_conversion() {
+        use super::ffi::bgra_to_nv12_full_range_vimage;
+        let colors: [[u8; 4]; 7] = [
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+            [128, 128, 128, 255],
+            [30, 140, 220, 255],
+        ];
+        let (w, h) = (6usize, 4usize);
+        let stride = w * 4;
+        for c in colors {
+            let mut bgra = vec![0u8; stride * h];
+            for px in bgra.chunks_exact_mut(4) {
+                px.copy_from_slice(&c);
+            }
+            let (mut y, mut cbcr) = (vec![0u8; w * h], vec![0u8; w * (h / 2)]);
+            bgra_to_nv12_full_range_vimage(&bgra, stride, w, h, &mut y, w, &mut cbcr, w)
+                .expect("forward conversion");
+            let mut back = Vec::new();
+            nv12_full_range_to_bgra(&y, w, &cbcr, w, w, h, &mut back).expect("inverse conversion");
+            assert_eq!(back.len(), stride * h);
+            for px in back.chunks_exact(4) {
+                for ch in 0..3 {
+                    let d = (i32::from(px[ch]) - i32::from(c[ch])).abs();
+                    assert!(d <= 3, "channel {ch} of {c:?} came back as {px:?}");
+                }
+                assert_eq!(px[3], 255, "opaque alpha");
+            }
         }
     }
 
@@ -1691,6 +1962,58 @@ mod tests {
             !first.parameter_sets.is_empty(),
             "keyframe should carry SPS/PPS parameter sets"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_due_every_interval_frames() {
+        // Interval 6: due once 6 frames (counting the last keyframe) are out.
+        assert!(!keyframe_due(1, 6));
+        assert!(!keyframe_due(5, 6));
+        assert!(keyframe_due(6, 6));
+        assert!(keyframe_due(7, 6));
+        // A zero interval is treated as 1: every frame.
+        assert!(keyframe_due(1, 0));
+    }
+
+    /// Encode `n` distinct frames and return which of them came out as
+    /// keyframes (indices within this batch).
+    fn keyframe_positions(enc: &mut Encoder, first: u32, n: u32) -> Result<Vec<u32>> {
+        let (w, h) = (enc.width, enc.height);
+        let stride = usize::from(w) * 4;
+        let mut out = Vec::new();
+        for f in first..first + n {
+            let mut frame = vec![0u8; stride * usize::from(h)];
+            for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+                px[0] = ((i as u32 + f * 7) % 251) as u8;
+                px[1] = (f * 13 % 255) as u8;
+                px[2] = 0x40;
+                px[3] = 0xff;
+            }
+            enc.encode_bgra(&frame, stride, false)?;
+            for fr in enc.flush()? {
+                if fr.is_keyframe {
+                    out.push(f - first);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// THE 2026-11-13 BUG: VideoToolbox ignores a mid-session change to
+    /// `MaxKeyFrameInterval`, so the adaptive controller's keyframe backoff
+    /// did nothing. The encoder now schedules keyframes itself, so stretching
+    /// the interval stops them and restoring it brings them back at once.
+    #[test]
+    fn the_keyframe_interval_can_be_changed_mid_session() -> Result<()> {
+        let mut enc = Encoder::new(320, 240, 30, 2_000_000, 0.2)?; // 6 frames
+        assert_eq!(keyframe_positions(&mut enc, 0, 18)?, vec![0, 6, 12]);
+
+        enc.set_keyframe_interval(36_000); // the backoff's stretch
+        assert_eq!(keyframe_positions(&mut enc, 18, 30)?, Vec::<u32>::new());
+
+        enc.set_keyframe_interval(6); // restored: overdue, so at once
+        assert_eq!(keyframe_positions(&mut enc, 48, 13)?, vec![0, 6, 12]);
         Ok(())
     }
 }
