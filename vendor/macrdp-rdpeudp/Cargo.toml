@@ -22,11 +22,11 @@ proptest = "1"
 # two resolve to the same rev, so the crate behaves identically either way.
 # `alloc` gives encode_vec / decode (used by the codecs + tests). macrdp's build
 # enables it transitively; the standalone build needs it explicitly.
-ironrdp-core = { version = "0.2", features = ["alloc"] }
+ironrdp-core = { version = "0.3", features = ["alloc"] }
 bitflags = "2"
 
 [patch.crates-io]
 # Honored only when this crate is built as the top-level (standalone tests).
 # Ignored when it's a path dependency of macrdp (the root's [patch] wins). Keep
 # the rev in sync with the root Cargo.toml.
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "0087f037ebbb569570c7a01c06c05cc40b835fba" }

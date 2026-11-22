@@ -63,7 +63,7 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
-    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
+    EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
 };
 use ironrdp_svc::ChannelFlags;
@@ -184,6 +184,10 @@ struct ConnectionContext {
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
+    /// The client advertised an EGFX capability set newer than Windows App for
+    /// macOS does, so its zero decode+render time doesn't mean "not presenting"
+    /// and blank recovery stays off for this connection ([`advertises_egfx_beyond_mac_client`]).
+    newer_egfx_client: bool,
     /// Channel-level decline, shared with this connection's `GfxDvcBridge`
     /// (`with_decline_flag`). Set true in `on_ready` when the client
     /// advertised EGFX but no AVC420 support: the bridge then discards ALL
@@ -1091,6 +1095,41 @@ fn blank_rtt_gate(link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
         return None;
     }
     Some((f64::from(link_rtt_ms) / 25.0).clamp(1.0, 4.0))
+}
+
+/// The newest EGFX capability version Windows App for macOS advertises
+/// (undocumented, unparsed by this build). Clients that advertise anything
+/// newer are the ones [`advertises_egfx_beyond_mac_client`] picks out.
+const MAC_WINDOWS_APP_NEWEST_EGFX: u32 = 0x000B_0101;
+
+/// Whether the client advertised an EGFX capability set newer than
+/// [`MAC_WINDOWS_APP_NEWEST_EGFX`].
+///
+/// Windows App on Windows advertises 0x000B0101, 0x000B0200, 0x000B0300 and
+/// 0x000B0500, and its QoE reports carry a decode+render time only for the
+/// first frame: every later report says 0 while it presents normally (captured
+/// 2026-11-20, issue #269: 1 nonzero of 217 reports over 42 s, against 95–100%
+/// for mstsc). The blank detector reads that as the reconnect-blank and drops a
+/// working session three times. mstsc advertises nothing past V10.6, and
+/// Windows App for macOS nothing past 0x000B0101; both keep blank recovery
+/// (the macOS client has had real reconnect-blanks). The iOS Windows App
+/// advertises 0x000B0300 (#211), so it is covered too; there is no QoE data
+/// from it either way. Pure, unit-tested.
+fn advertises_egfx_beyond_mac_client(versions: impl IntoIterator<Item = u32>) -> bool {
+    versions
+        .into_iter()
+        .any(|v| v > MAC_WINDOWS_APP_NEWEST_EGFX)
+}
+
+/// The blank detector's per-connection gate: [`blank_rtt_gate`], except that a
+/// client whose zero decode+render time doesn't mean "not presenting"
+/// ([`advertises_egfx_beyond_mac_client`]) is never evaluated. `None` = disarmed
+/// for this connection. Pure, unit-tested.
+fn blank_detector_gate(newer_egfx_client: bool, link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
+    if newer_egfx_client {
+        return None;
+    }
+    blank_rtt_gate(link_rtt_ms, max_rtt_ms)
 }
 
 /// Scale a [`BlankRecoveryParams`] evidence window by the RTT multiplier from
@@ -2254,9 +2293,22 @@ impl Gfx {
                 // unreliable (a rendering ZeroTier client reports zero), so the
                 // evidence window scales with RTT and past `max_rtt_ms` the
                 // drop lever is withheld entirely for this connection.
-                let gate = blank_rtt_gate(ctx.link_rtt_ms, self.blank_params.max_rtt_ms);
+                let gate = blank_detector_gate(
+                    ctx.newer_egfx_client,
+                    ctx.link_rtt_ms,
+                    self.blank_params.max_rtt_ms,
+                );
                 if !ctx.blank_gate_logged {
                     match gate {
+                        None if ctx.newer_egfx_client => {
+                            ctx.blank_gate_logged = true;
+                            info!(
+                                "blank recovery DISARMED for this connection — the client advertises EGFX \
+                                 capability sets newer than Windows App for macOS does (Windows App on \
+                                 Windows or iOS), and reports zero decode+render time while presenting, so \
+                                 the zero-render-time signal can't tell a blank from a working session (#269)"
+                            );
+                        }
                         None => {
                             ctx.blank_gate_logged = true;
                             info!(
@@ -3421,26 +3473,10 @@ impl ServerEventSender for Gfx {
 }
 
 impl Gfx {
-    /// Identity of the connection whose context is active (the address of its
-    /// `GraphicsPipelineServer`), so a test can tell one connection's context
-    /// from another's.
-    #[cfg(test)]
-    pub(crate) fn active_connection(&self) -> Option<usize> {
-        self.ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
-    }
-}
-
-impl GfxServerFactory for Gfx {
-    fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
-        // We override build_server_with_handle, so this is only a safety stub.
-        Box::new(StubHandler)
-    }
-
-    fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+    /// Builds the connection's EGFX server and its context (see
+    /// [`GfxServerFactory::build_server_with_handle`]). Separate from the trait
+    /// method so tests can call it: they cannot build a `GfxContext`.
+    pub(crate) fn build_connection_server(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         let handler = Box::new(GfxHandler {
             ctx: self.ctx.clone(),
         });
@@ -3490,6 +3526,7 @@ impl GfxServerFactory for Gfx {
             epoch: Instant::now(),
             need_keyframe: true,
             client_supports_avc: false,
+            newer_egfx_client: false,
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
@@ -3539,6 +3576,32 @@ impl GfxServerFactory for Gfx {
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
             handle,
         ))
+    }
+
+    /// Identity of the connection whose context is active (the address of its
+    /// `GraphicsPipelineServer`), so a test can tell one connection's context
+    /// from another's.
+    #[cfg(test)]
+    pub(crate) fn active_connection(&self) -> Option<usize> {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
+    }
+}
+
+impl GfxServerFactory for Gfx {
+    fn build_gfx_handler(&self, _ctx: GfxContext) -> Box<dyn GraphicsPipelineHandler> {
+        // We override build_server_with_handle, so this is only a safety stub.
+        Box::new(StubHandler)
+    }
+
+    fn build_server_with_handle(
+        &self,
+        _ctx: GfxContext,
+    ) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        self.build_connection_server()
     }
 }
 
@@ -3637,8 +3700,11 @@ impl GraphicsPipelineHandler for GfxHandler {
             unparsed = ?unparsed,
             "EGFX: client advertised capabilities"
         );
+        let newer_egfx_client =
+            advertises_egfx_beyond_mac_client(pdu.0.iter().map(|raw| raw.version.0));
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.client_supports_avc = supports_avc;
+            ctx.newer_egfx_client = newer_egfx_client;
         }
     }
 
@@ -5182,6 +5248,73 @@ mod tests {
         }
     }
 
+    /// #269: blank recovery stays off for the client family whose QoE reports
+    /// zero decode+render time while presenting, and only for it. The lists are
+    /// the capability versions each client advertised in the 2026-11-20 capture
+    /// (iOS from #211).
+    #[test]
+    fn blank_recovery_skips_clients_beyond_the_mac_windows_app() {
+        use ironrdp_egfx::pdu::CapabilityVersion as V;
+        let windows_app_windows = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_5.0,
+            V::V10_6.0,
+            V::V10_7.0,
+            0x000B_0101,
+            0x000B_0200,
+            0x000B_0300,
+            0x000B_0500,
+        ];
+        let mstsc = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_5.0,
+            V::V10_6.0,
+        ];
+        let windows_app_macos = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_7.0,
+            0x000B_0101,
+        ];
+        let windows_app_ios_unparsed = [0x000B_0101, 0x000B_0300];
+        assert!(advertises_egfx_beyond_mac_client(windows_app_windows));
+        assert!(advertises_egfx_beyond_mac_client(windows_app_ios_unparsed));
+        // The macOS client and mstsc have had real reconnect-blanks: recovery stays on.
+        assert!(!advertises_egfx_beyond_mac_client(mstsc));
+        assert!(!advertises_egfx_beyond_mac_client(windows_app_macos));
+        assert!(!advertises_egfx_beyond_mac_client([]));
+    }
+
+    #[test]
+    fn blank_detector_gate_disarms_newer_clients_whatever_the_link() {
+        // A newer client is never evaluated, on a LAN, an unknown link, or with
+        // RTT gating turned off.
+        assert_eq!(blank_detector_gate(true, 2, 80), None);
+        assert_eq!(blank_detector_gate(true, 0, 80), None);
+        assert_eq!(blank_detector_gate(true, 2, 0), None);
+        // Every other client gets exactly the RTT gate.
+        for (rtt, max) in [(0, 80), (2, 80), (50, 80), (80, 80), (200, 80), (200, 0)] {
+            assert_eq!(
+                blank_detector_gate(false, rtt, max),
+                blank_rtt_gate(rtt, max)
+            );
+        }
+    }
+
     #[test]
     fn blank_rtt_gate_lan_and_unknown_pass_through_unscaled() {
         // LAN (≤25 ms) and unknown (0) keep the exact pre-RTT-gate behavior.
@@ -6513,7 +6646,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
         );
-        assert!(gfx.build_server_with_handle().is_some());
+        assert!(gfx.build_connection_server().is_some());
         gfx
     }
 

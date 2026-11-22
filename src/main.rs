@@ -447,6 +447,16 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
+    /// Report network characteristics to the client (MS-RDPBCGR 2.2.14
+    /// auto-detect): RTT probes and bandwidth measurements on the MCS message
+    /// channel, and Network Characteristics Result PDUs the client can show, for
+    /// example in the Windows connection-quality dialog. IronRDP's own
+    /// auto-detect does the work; macrdp ticks it once a second. Only for
+    /// clients that open the message channel. Opt-in (default off). Config:
+    /// NETWORK_AUTODETECT=1.
+    #[arg(long)]
+    network_autodetect: bool,
+
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
     /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
@@ -694,7 +704,7 @@ struct Args {
     #[arg(long)]
     enable_microphone_redirection: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
+    /// Opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
     /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
     /// (the proven safe spike) — pass --udp-migrate-egfx to actually move the
@@ -734,7 +744,7 @@ struct Args {
     #[arg(long)]
     adaptive_bitrate: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
+    /// Opt-in (default OFF; implies --enable-udp-multitransport,
     /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
     /// UDP/DTLS tunnel with 1+1 redundancy instead of TCP — the loss-resilient audio
     /// path. The MS-RDPEA format handshake runs on a reliable DVC over TCP; AAC Wave2
@@ -2582,6 +2592,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("NETWORK_AUTODETECT", false) {
+        argv.push("--network-autodetect".into());
+    }
     if on("CAPTURE_NV12", false) {
         argv.push("--capture-nv12".into());
     }
@@ -2869,6 +2882,34 @@ fn report_auth_failure(
             warn!(error = %e, "could not write the auth-status file for the controller");
         }
     }
+}
+
+/// How often `--network-autodetect` ticks IronRDP's auto-detect. Each tick
+/// sends one RTT probe; every 8th starts a bandwidth measurement over the next
+/// 4 ticks; a Network Characteristics Result goes out at most once a second.
+const AUTODETECT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Send `ServerEvent::AutoDetectRttRequest` every `period` until the server's
+/// event channel closes. A tick sent while no session is served is discarded by
+/// the server's accept loop (and by the drain before a takeover), so ticks
+/// can't pile up and reach the next client as a burst of probes.
+fn spawn_autodetect_ticker(
+    events: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if events
+                .send(ironrdp_server::ServerEvent::AutoDetectRttRequest)
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 async fn async_main() -> Result<()> {
@@ -3680,12 +3721,11 @@ async fn async_main() -> Result<()> {
     let click_signal =
         (args.enable_h264 && keyframe_on_change.enabled).then(crate::capture::ClickSignal::new);
 
-    // Shared "client minimized / SuppressOutput" flag — created here so
-    // the same `Arc<AtomicBool>` can be handed to both the capture
-    // backend (which reads it to gate frame emission) and the vendor
-    // server (whose per-connection PDU handler writes it). See
-    // `vendor/ironrdp-server` `display_suppressed` plumbing.
-    let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Shared "client minimized / SuppressOutput" flag, read by the capture
+    // backend (to gate frame emission) and the audio capture (to mute). The
+    // server writes a new flag for each connection; `CaptureDisplay::updates`
+    // puts that connection's flag into this slot.
+    let display_suppressed = capture::SuppressedFlag::default();
 
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
@@ -3835,6 +3875,8 @@ async fn async_main() -> Result<()> {
     //   a client still handshaking;
     // - the client's keyboard-layout id, for the input handler to auto-select a
     //   matching non-US layout when --keyboard-layout is unset.
+    // - the input-reset flag, so the input handler clears held modifiers and
+    //   buttons once per served connection.
     let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
     hooks.extend(auth_guard::AuthGuardHandler::from_env());
     if let Some(activity) = &lock_activity {
@@ -3842,6 +3884,9 @@ async fn async_main() -> Result<()> {
     }
     hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
         keyboard_layout_klid,
+    )));
+    hooks.push(Box::new(conn_hooks::InputResetHook(
+        input::modifier_reset_handle(),
     )));
     // `--virtual-display-hidpi=auto` sizes the virtual display from the
     // desktop scale factor the connecting client announces.
@@ -3926,9 +3971,6 @@ async fn async_main() -> Result<()> {
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
-        // Share the suppress flag with the capture backend, so the server's
-        // per-connection PDU handler writes to the `AtomicBool` it reads.
-        .with_display_suppressed_handle(display_suppressed)
         .with_honor_client_desktop_size(honor_client_size)
         .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
         // macrdp is a single console session: a new authenticated client takes it
@@ -3937,21 +3979,12 @@ async fn async_main() -> Result<()> {
         .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .build();
 
-    // Per-SERVED-connection reset for the input handler's held-modifier and
-    // button-down state (vendored divergence 24). The server raises this once
-    // at the top of `run_connection`/`serve_negotiated` — not on a live-resize
-    // or blank-recovery reactivation, and not for a preemption candidate — and
-    // the input handler drains it on its next event. See
-    // `input::modifier_reset_handle` for why the display `updates()` path and
-    // `on_accept` were both the wrong seam.
-    server.set_input_reset_handle(input::modifier_reset_handle());
-
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
 
-    // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
+    // UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
     // and (M3) bind a real UDP listener on the same address/port as TCP — the
     // client reuses the server address for the auxiliary UDP flow. The handle is
@@ -4087,6 +4120,19 @@ async fn async_main() -> Result<()> {
     } else {
         None
     };
+
+    // Network auto-detect (--network-autodetect). IronRDP's AutoDetectManager
+    // sends the RTT probes, brackets ordinary traffic for the bandwidth
+    // measurement and reports the results; it only needs a periodic tick.
+    if args.network_autodetect {
+        server.enable_autodetect();
+        spawn_autodetect_ticker(server.event_sender().clone(), AUTODETECT_TICK);
+        info!(
+            tick_ms = AUTODETECT_TICK.as_millis() as u64,
+            "network auto-detect enabled (--network-autodetect): RTT and bandwidth are measured and \
+             reported to clients that open the message channel"
+        );
+    }
 
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.

@@ -7,45 +7,59 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Open PRs — review state (as of 2026-11-17).** Labels track it: `waiting on author` = the
-  contributor owes a change; everything else is ours. Merged 11-12→17: #197 #200 #201 #204 #219 #228
-  #230 #240/#254 #255 #256 #257 #258 #259 #260 #263 #264 #265 #267 #268.
-  - **#262** (@antonmos, `--h264-max-unacked-frames`) — flush frames now exempt; their live data shows
-    the worst write stall 774 ms → <140 ms (uncontrolled). **Doesn't compile on `main` since #230**:
-    `send_held_frame`'s `submit_to_gfx` needs `flush = false`; asked them to merge `main` and add it
-    (11-16). Then our mstsc test on the mini, then merge.
+- [ ] **Live-test checklist for the macrdp PR that moves the pins to `macrdp-79e763a0` (rophy, #275).**
+  Before merging: `cargo tree` and `cargo-deny` before and after (upstream's lockfile trips zstd-safe,
+  hickory-proto and libz-sys advisories; zstd-safe 7.4.1 is fine), and the pin guard on the new branch.
+  Live, on the mini, with UDP and lossy audio on:
+  - Clients: mstsc (Windows 11, and Windows 10 if available), Windows App on Windows (stays connected
+    first time: #273 reads the EGFX capability list) and on macOS (blank recovery still armed), FreeRDP.
+  - Picture, sound, clipboard both ways (text, rich text, files), drive redirection read and write,
+    microphone, camera, USB (drive and gamepad), smart card.
+  - Resize (live and maximize), minimize and restore, takeover by a second client, wrong password refused,
+    auto-reconnect after a network drop, blank recovery.
+  - Audio latency vs v0.10.9 (waves now queue behind a batch): mstsc resize and a drive copy while audio
+    plays.
+  - Stuck-modifier reset, now raised from `on_connection_info`: hold Ctrl (or start a drag), drop the
+    connection, reconnect, check clicks are normal; and check a takeover attempt doesn't clear the live
+    session's held keys.
+  - Connect-time auto-detect (`NETWORK_AUTODETECT=1`): "good" quality, no slow-network warning.
+  - Then a 48 h soak before any release.
+
+- [ ] **Open PRs — review state (as of 2026-11-21).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-12→21: #197 #200 #201 #204 #219 #228
+  #230 #240/#254 #255 #256 #257 #258 #259 #260 #262 #263 #264 #265 #267 #268 #270 #271 #272 #273.
   - **#231 / #232** (@SferaDev, virtual display re-registered after display sleep / wake the displays) —
     both conflict with `main` after #201, and with each other; asked to merge #231 first and rebase #232
     on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
     keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
     also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
-  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
+  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in
+    (11-13), then (11-16) to keep `FINALIZE_TIMEOUT` around its replacement login loop and to skip,
+    not fail on, unexpected frames during the measurement. No commits since 10-27.
   - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
-    command, = upstream #2229 `e20a2147`, so (34) also drops at a pin bump past it).
-  - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
-    for rophy's PR into it.
-  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
-    divergence (32) drops out at the next pin bump to any rev at or after it.
-  - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
-    the `conn_test` regression tests for (31) and (32)): (29) pointer AND mask (≥ `fb25b47c`), (31) hidden/default
-    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`), (34) RemoteFX surface command
-    (≥ `e20a2147`).
+    command, = upstream #2229 `e20a2147`, so (34) also drops at a rebase past it).
+  - **#225** (IronRDP changes on clintcan/IronRDP instead of `vendor/`): **done, closed 2026-11-21.**
+    #271 (rophy) moved every `ironrdp-*` crate to the fork's `macrdp` branch at `6d90c7e8`; #272 added
+    `scripts/check-ironrdp-pin.sh` (CI, the daily security workflow, before release builds). The fork's
+    Actions are off and only an admin can update `macrdp*`. See `docs/ironrdp-divergences.md`, "Keeping the
+    fork safe". A divergence change is now a PR into the fork's `macrdp`, then a rev bump on all pins here.
+  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Divergence (32)
+    drops out at the next rebase of the fork's `macrdp` branch onto any upstream rev at or after it.
+  - **Next rebase of the fork's `macrdp` branch onto newer upstream drops these `ironrdp-server`
+    divergences** (all merged upstream; keep the `conn_test` regression tests for (31) and (32)): (29)
+    pointer AND mask (≥ `fb25b47c`), (31) hidden/default pointer updates (≥ `904a7da6`), (32) negotiation
+    timeout (≥ `e482e340`), (34) RemoteFX surface command (≥ `e20a2147`). Also (30), once upstream
+    Devolutions/IronRDP#2465 (glamberson's fix for our #2280) merges. The rebase goes on a new branch,
+    `macrdp-<upstream-rev>`; the old one stays so older releases still build.
 
-- [ ] **Before the next release: smoke-test #230 on Windows 11 mstsc and Windows App.** The legacy hold
-  is on by default (3 s) for every H.264 connection; only Windows 10 was tested live. Add the hold to the
-  Windows 10 note in `docs/known-quirks.md`.
-
-- [ ] **Graduate `--enable-udp-multitransport` and `--enable-lossy-audio` from experimental (still
-  opt-in; `--udp-migrate-egfx` stays experimental).** Regression test landed (#268). 48 h soak with both
-  on is running on the mini (v0.10.6, sampler `~/macrdp-soak-sampler-udp.sh`, started 2026-11-16 18:48
-  UTC). If clean: drop "EXPERIMENTAL" from those two flags in `docs/cli.md` / `docs/features.md`.
-  Later: lossy audio + `--udp-migrate-egfx` together needs two tunnels and one Soft-Sync with two lists;
-  the 11-16 spike showed mstsc opens both (stash `spike: second reliable UDP offer`). Disconnect must
-  retire both tunnels' bound flags, or the listener reads the idle one as dead.
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
   `macrdp::h264=debug` so the next real occurrence shows whether a 1–2 s video backlog came with it.
+  **2026-11-22:** seen on Windows App on Windows (TCP only), on both v0.10.9 and #276's build: a small
+  offset at connect, which the user judged to be audio late rather than video. The A/V resync hotkey fixed it
+  every time and reported 0 unacked frames each time, so there was no video backlog on the server side. Not a
+  regression; next step is the audio side (client playback buffer start, or the first waves' timing).
 
 - [ ] **Next toolchain bump:** clippy on Rust 1.98 flags `chunks_exact_to_as_chunks` in our code (reported
   by rophy on #228). We pin 1.95, so CI is unaffected until then.
@@ -92,6 +106,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
   "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
 
 ## Deferred — scoped, not started
+
+- [ ] **Pre-existing gaps found reviewing the 79e763a0 rebase (clintcan/IronRDP#3, 2026-11-21).** Not
+  regressions; present on `macrdp` too. (a) After an in-place Deactivation-Reactivation (blank recovery), the
+  UDP tunnel's inbound receiver isn't re-taken (`TunnelInbound::take` runs once per client loop), so data the
+  client sends over the tunnel (EGFX acks once migrated) is dropped. (b) A connection that dies between cookie
+  registration and `mt_on_finalized` leaves its tunnel-bound flag raised (cookie still evicted). (c) The camera
+  enumerator has no per-connection cap on DEVICE_ADDED (URBDRC has `MAX_DEVICE_CHANNELS`). (d) The
+  client-supplied hostname is logged with `%` (log injection).
 
 - [ ] **UDP: lossy audio and `--udp-migrate-egfx` can't both migrate in one session.** A connection gets one
   Soft-Sync request, and with lossy audio on, the audio channel takes it (`mt_soft_sync_on_egfx`). Fixing it
@@ -636,6 +658,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Parked — scoped, low priority
 
+- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** **Design written: `docs/udp-two-tunnels-design.md`** (2026-11-22); build it on `macrdp-79e763a0` after the pin move. Today a connection gets one Soft-Sync, and
+  lossy audio takes it, so video stays on TCP. Fix: offer a reliable and a lossy tunnel, then one Soft-Sync
+  with two channel lists. The 2026-11-16 spike showed mstsc opens both tunnels (local stash `spike: second
+  reliable UDP offer`). The listener already keys peers by address; the work is per-tunnel state in
+  `mt/session.rs`, a list-taking `request_soft_sync` in the dvc fork, and per-tunnel recovery. Disconnect must
+  retire both tunnels' bound flags, or the listener reads the idle one as dead. Low value on a LAN, where
+  video over UDP gains little over TCP.
+
 - [x] **Headless-lock arc — LANDED on `main` 2026-07-23 (pending a release tag).** Merged this
   session: **`--shield-primary`** opt-in lockable headless blanking (#170; single-panel engage
   #171, @antonmos), the **`Ctrl+Alt+G` majority-area gather** (mostly-off windows now swept),
@@ -734,7 +764,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - **▶ UPDATE 2026-09-16 — supersedes the "ZERO open clintcan PRs" note below.** clintcan has 0 open
   upstream PRs and 2 open issues (#1484, #1969). Detail: the `project_upstream_ironrdp_open_prs` memory
-  and the divergence notes in `vendor/ironrdp-server/CLAUDE.md`.
+  and the divergence notes in `docs/ironrdp-divergences.md`.
   - **Divergence (23), second-client preemption, is upstream — with traps.** #1476 MERGED 2026-09-08;
     #1913 MERGED 2026-09-11 replaced its bool with `ConnectionPolicy { Queue (default), Reject, Preempt }`
     via `with_connection_policy`. The bump must add `.with_connection_policy(ConnectionPolicy::Preempt)`
@@ -860,7 +890,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   - **Structural:** upstream added `server/src/multitransport.rs` (clashes with our
     `src/multitransport/` dir — rename ours); upstream now has its OWN `ironrdp-rdpeudp` crate (name
     clash with `vendor/ironrdp-rdpeudp` — rename via `package =` or drop ours); stray committed
-    `vendor/ironrdp-server/Cargo.toml.orig` to delete.
+    `Cargo.toml.orig` in the vendored server to delete.
   - **Triage correction:** acceptor (3) is only half group-1 — the client MT flags are upstream, but our
     acceptor-side MT *offer* (`MultitransportOffer`, `multitransport_offered`) isn't (upstream offers via
     #1951) → goes with the UDP work.
@@ -869,7 +899,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
     tests → live mstsc/FreeRDP → 48–72 h soak incl. a headless mode → v0.10.0.
   - **▶ PROGRESS 2026-10-01: code steps DONE** (commits `accaf99`..`134d2e5`): dvc fork shrunk to one
     addition, acceptor/rdpdr/server re-vendored as upstream-verbatim + our files + marked hooks
-    (`vendor/ironrdp-server/CLAUDE.md`; old log frozen in `DIVERGENCE-HISTORY.md`), `vendor/ironrdp-rdpeudp`
+    (`docs/ironrdp-divergences.md`; old log frozen in `docs/ironrdp-divergence-history.md`), `vendor/ironrdp-rdpeudp`
     → `vendor/macrdp-rdpeudp`, `src/` on the new API (`ConnectionHooks`, builder chain incl.
     `ConnectionPolicy::Preempt`). 266 tests pass; fmt/clippy/deny clean on macOS; Linux = CI.
     **NEXT — live tests:** ARC after a process RESTART (upstream HMAC now denies it), Preempt takeover,
@@ -909,7 +939,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `+auto-reconnect` connected, `launchctl kickstart -k` the agent. The client auto-reconnects
     presenting its old cookie; CredSSP succeeds (`auth outcome=success`), then
     `verify_auto_reconnect_cookie` fails → `send_access_denied` + `ServerError("cookie rejected")`
-    (`vendor/ironrdp-server/src/server.rs` ~4577). FreeRDP keeps the cookie and retries ~3/s with its
+    (`crates/ironrdp-server/src/server.rs` ~4577, (clintcan/IronRDP)). FreeRDP keeps the cookie and retries ~3/s with its
     counter stuck at 0, and each try ends errored in < 1 s, so `auth_guard::classify_outcome` counts
     it as a Failure → `reject reason=lockout` after 5 (30 s, then 59 s), blocking every client from
     that IP. Preempt runs before the cookie check, so each try also EVICTS whoever is connected. `main`
@@ -917,8 +947,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     fall back to a normal logon (`is_auto_reconnect = false`, so the credential path still runs)
     instead of denying — check MS-RDPBCGR's ARC rules first, and raise it upstream. mstsc likely hits
     it too (it presents the cookie on auto-reconnect) — verify when at the Windows machine.
-  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** The rdpeudp step, and
-    the `vendor/ironrdp-server` unit-test step from #228, run `cargo test --manifest-path vendor/…`
+  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** *(2026-11-20, #225:
+    the server step now runs `--locked` on a checkout of clintcan/IronRDP; the rdpeudp step is left.)*
+    The rdpeudp step, and
+    the `ironrdp-server` unit-test step from #228, ran `cargo test --manifest-path vendor/…`
     with no `--locked` and no committed lockfile (`.gitignore` has `vendor/*/Cargo.lock`), so every CI
     run resolves crates.io fresh ("Locking 377 packages to latest…") and would execute a newly
     published malicious release. Contained (no secrets, `contents: read`, harden-runner audit-only,
@@ -961,7 +993,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (do NOT file a competing PR): (a) the ironrdp-server seam = uchouT's OPEN PR #1417 (adds
   ServerBuilder::with_usb_factory + src/urbdrc.rs + UsbDeviceHandle + per-device backend — near-exact
   match to div 16; blocked by #1416, stale 07-15); (b) when #1417+#1394 merge + pin bump, macrdp adopts
-  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES vendor/ironrdp-server/src/rdpeusb.rs.
+  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES crates/ironrdp-server/src/rdpeusb.rs (clintcan/IronRDP).
   Only constructive move for us: VALIDATE #1417 from macrdp's real-URBDRC-server perspective (like the
   #1509 validation) once it's unblocked. Track it, don't file. Pin-bump-era adoption. -->
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
